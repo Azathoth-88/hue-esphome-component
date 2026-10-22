@@ -45,7 +45,9 @@ class RGBCCTLightOutput : public light::LightOutput {
     float green = state->current_values.get_green();
     float blue = state->current_values.get_blue();
     float color_temp_mired = state->current_values.get_color_temperature();
-    const float brightness = state->current_values.get_brightness() * state->current_values.get_state();
+    // Apply the light's gamma_correct curve to brightness so dimming is perceptually linear
+    const float brightness =
+        state->gamma_correct_lut(state->current_values.get_brightness() * state->current_values.get_state());
     const bool is_ct_mode = state->current_values.get_color_mode() == light::ColorMode::COLOR_TEMPERATURE;
 
     if (is_ct_mode) {
@@ -74,16 +76,27 @@ class RGBCCTLightOutput : public light::LightOutput {
       cwhite = (cw_fraction / max_cw_ww);
       wwhite = (ww_fraction / max_cw_ww);
 
-      if (color_temp_mired < this->cold_white_mireds_)
-        cwhite = 1.0f - ((this->cold_white_mireds_ - color_temp_mired) / 100.0f);
-      else if (color_temp_mired > this->warm_white_mireds_)
-        wwhite = 1.0f - ((color_temp_mired - this->warm_white_mireds_) / 100.0f);
+      // RGB only outside the white LED range: cross-fade from white to RGB between the
+      // white LED limit and the configured min/max color temperature
+      float rgb_level = 0.0f;
+      if (color_temp_mired < this->cold_white_mireds_) {
+        rgb_level = fade_level_(this->cold_white_mireds_ - color_temp_mired, this->cold_white_mireds_ - this->min_mireds_);
+        cwhite = 1.0f - rgb_level;
+      } else if (color_temp_mired > this->warm_white_mireds_) {
+        rgb_level = fade_level_(color_temp_mired - this->warm_white_mireds_, this->max_mireds_ - this->warm_white_mireds_);
+        wwhite = 1.0f - rgb_level;
+      }
+      red *= rgb_level;
+      green *= rgb_level;
+      blue *= rgb_level;
     }
 
-    // sRGB gamma correction
-    red   = (red   > 0.04045f) ? powf((red   + 0.055f) / 1.055f, 2.4f) : (red   / 12.92f);
-    green = (green > 0.04045f) ? powf((green + 0.055f) / 1.055f, 2.4f) : (green / 12.92f);
-    blue  = (blue  > 0.04045f) ? powf((blue  + 0.055f) / 1.055f, 2.4f) : (blue  / 12.92f);
+    // sRGB -> linear for RGB mode only; the blackbody LUT values are already linear
+    if (!is_ct_mode) {
+      red   = (red   > 0.04045f) ? powf((red   + 0.055f) / 1.055f, 2.4f) : (red   / 12.92f);
+      green = (green > 0.04045f) ? powf((green + 0.055f) / 1.055f, 2.4f) : (green / 12.92f);
+      blue  = (blue  > 0.04045f) ? powf((blue  + 0.055f) / 1.055f, 2.4f) : (blue  / 12.92f);
+    }
 
     red *= brightness;
     green *= brightness;
@@ -115,6 +128,11 @@ class RGBCCTLightOutput : public light::LightOutput {
   }
 
  protected:
+  // Fraction of the way through a fade of the given span; a zero/negative span switches instantly
+  static float fade_level_(float distance, float span) {
+    return span > 0.0f ? clamp<float>(distance / span, 0.0f, 1.0f) : 1.0f;
+  }
+
   output::FloatOutput *red_{nullptr};
   output::FloatOutput *green_{nullptr};
   output::FloatOutput *blue_{nullptr};
@@ -127,7 +145,8 @@ class RGBCCTLightOutput : public light::LightOutput {
   float max_mireds_{0.0f};
   float max_combined_white_level_{1.0f};
 
-  // Charity blackbody LUT — 2° CMF, sRGB, 1000–6500K every 100K
+  // Charity blackbody LUT — 2° CMF, sRGB primaries, 1000–6500K every 100K
+  // Linear (not gamma-encoded) R G B float columns of bbr_color.txt
   // http://www.vendian.org/mncharity/dir3/blackbody/
   static constexpr int LUT_SIZE = 56;
   static constexpr float k_lut[LUT_SIZE] PROGMEM = {
